@@ -15,6 +15,8 @@ import matplotlib.patches as patches
 
 from environments import ENV_BUILDERS, DIFFICULTY_LABELS
 from prm_basic import BasicPRM
+from prm_rl import PRMRL
+from rl.local_policy import LocalPolicy, ReactivePolicy
 from executor import PathExecutor
 from metrics import trial_metrics
 
@@ -24,6 +26,7 @@ from metrics import trial_metrics
 # and implement construct() and find().
 PLANNER_CLASSES = {
     "Basic": BasicPRM,
+    "PRM-RL": PRMRL,
 }
 
 
@@ -141,14 +144,29 @@ def main():
                         choices=list(PLANNER_CLASSES.keys()))
     parser.add_argument("--gui", action="store_true")
     parser.add_argument("--seed", type=int, default=42)
+    parser.add_argument("--policy", type=str, default=None,
+                        help="Path to trained RL model .zip (for PRM-RL). "
+                             "If omitted, uses ReactivePolicy fallback.")
     args = parser.parse_args()
 
     np.random.seed(args.seed)
     env = ENV_BUILDERS[args.env](difficulty=args.diff, gui=args.gui)
 
     cls = PLANNER_CLASSES[args.planner]
-    planner = cls(client_id=env["cid"], workspace_bounds=env["bounds"],
-                  robot_radius=env["robot_radius"], dim=env["dim"])
+
+    # PRM-RL needs a policy object
+    if args.planner == "PRM-RL":
+        if args.policy:
+            policy = LocalPolicy(args.policy)
+        else:
+            print("  (No --policy given, using ReactivePolicy fallback)")
+            policy = ReactivePolicy()
+        planner = cls(client_id=env["cid"], workspace_bounds=env["bounds"],
+                      robot_radius=env["robot_radius"], dim=env["dim"],
+                      policy=policy)
+    else:
+        planner = cls(client_id=env["cid"], workspace_bounds=env["bounds"],
+                      robot_radius=env["robot_radius"], dim=env["dim"])
     all_ids = env["static_ids"] + env["dyn_manager"].body_ids
     planner.set_obstacles(all_ids)
 
