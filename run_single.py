@@ -8,6 +8,7 @@ Usage:
 
 import argparse
 import time
+from typing import Any
 import numpy as np
 import pybullet as p
 import matplotlib.pyplot as plt
@@ -15,6 +16,7 @@ import matplotlib.patches as patches
 
 from environments import ENV_BUILDERS, DIFFICULTY_LABELS
 from prm_basic import BasicPRM
+from prm_risk_aware import RiskAwarePRM
 from prm_rl import PRMRL
 from rl.local_policy import LocalPolicy, ReactivePolicy
 from executor import PathExecutor
@@ -26,6 +28,7 @@ from metrics import trial_metrics
 # and implement construct() and find().
 PLANNER_CLASSES = {
     "Basic": BasicPRM,
+    "RiskAware": RiskAwarePRM,
     "PRM-RL": PRMRL,
 }
 
@@ -147,10 +150,28 @@ def main():
     parser.add_argument("--policy", type=str, default=None,
                         help="Path to trained RL model .zip (for PRM-RL). "
                              "If omitted, uses ReactivePolicy fallback.")
+    parser.add_argument("--risk-beta", type=float, default=0.5,
+                        help="RiskAware: clearance penalty weight")
+    parser.add_argument("--frontier-frac", type=float, default=0.3,
+                        help="RiskAware: fraction of frontier-biased samples")
+    parser.add_argument("--frontier-sigma", type=float, default=0.8,
+                        help="RiskAware: Gaussian spread for frontier samples")
+    parser.add_argument("--repair-samples", type=int, default=50,
+                        help="RiskAware: local samples added during replan")
     args = parser.parse_args()
 
+    if not (0.0 <= args.frontier_frac <= 1.0):
+        parser.error("--frontier-frac must be in [0, 1]")
+    if args.repair_samples < 0:
+        parser.error("--repair-samples must be >= 0")
+    if args.risk_beta < 0.0:
+        parser.error("--risk-beta must be >= 0")
+    if args.frontier_sigma < 0.0:
+        parser.error("--frontier-sigma must be >= 0")
+
     np.random.seed(args.seed)
-    env = ENV_BUILDERS[args.env](difficulty=args.diff, gui=args.gui)
+    env: dict[str, Any] = ENV_BUILDERS[args.env](difficulty=args.diff,
+                                                 gui=args.gui)
 
     cls = PLANNER_CLASSES[args.planner]
 
@@ -164,11 +185,18 @@ def main():
         planner = cls(client_id=env["cid"], workspace_bounds=env["bounds"],
                       robot_radius=env["robot_radius"], dim=env["dim"],
                       policy=policy)
+    elif args.planner == "RiskAware":
+        planner = cls(client_id=env["cid"], workspace_bounds=env["bounds"],
+                      robot_radius=env["robot_radius"], dim=env["dim"],
+                      risk_beta=args.risk_beta,
+                      frontier_frac=args.frontier_frac,
+                      frontier_sigma=args.frontier_sigma,
+                      repair_samples=args.repair_samples)
     else:
         planner = cls(client_id=env["cid"], workspace_bounds=env["bounds"],
                       robot_radius=env["robot_radius"], dim=env["dim"])
-    all_ids = env["static_ids"] + env["dyn_manager"].body_ids
-    planner.set_obstacles(all_ids)
+    # Build roadmap on static environment; dynamics handled reactively at runtime
+    planner.set_obstacles(env["static_ids"])
 
     print(f"[{args.planner}] Building PRM "
           f"(N={env['N']}, dmax={env['dmax']})...")
@@ -183,6 +211,8 @@ def main():
     else:
         print("  -> no path found")
 
+    # Restore full obstacle set before execution
+    planner.set_obstacles(env["static_ids"] + env["dyn_manager"].body_ids)
     print("Executing...")
     executor = PathExecutor(planner, env)
     record = executor.execute(path, cost)

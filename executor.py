@@ -91,9 +91,12 @@ class PathExecutor:
             if self._path_blocked_ahead(path, wp_idx - 1):
                 rec.replans += 1
                 cur_tuple = tuple(current)
-                # DynamicPRM gets obstacle positions for targeted repair
+                # Pass dynamic obstacle info to any planner whose replan()
+                # accepts it (e.g. RiskAwarePRM local repair, future planners).
+                # PRMBase.replan(**kw) absorbs unknown kwargs safely.#
                 kwargs = {}
-                if hasattr(self.planner, 'invalidate_near') and dyn_positions:
+                # Change here to abstract for Aware PRM.
+                if dyn_positions:
                     kwargs["dyn_positions"] = [
                         pos[:self.dim] for pos in dyn_positions]
                     kwargs["affect_radius"] = dmax * 0.6

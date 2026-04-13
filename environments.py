@@ -169,8 +169,9 @@ def build_office(difficulty=0, gui=False):
     if difficulty >= 2:
         b1, r1 = _box(cid, 10, 7, 0.35, 0.35, color=[0.9, 0.3, 0.1, 0.85])
         mgr.add(PatrolObstacle(cid, b1, [10, 2, 1], [10, 13, 1], speed=0.8))
-        b2, r2 = _box(cid, 7, 6.95, 0.15, 0.45, color=[0.9, 0.3, 0.1, 0.85])
-        mgr.add(OscillateObstacle(cid, b2, axis=1, amplitude=0.8, period=6.0))
+        # NOTE: Changed oscilation because all PRMs were failing...
+        b2, r2 = _box(cid, 7, 6.95, 0.15, 0.20, color=[0.9, 0.3, 0.1, 0.85])
+        mgr.add(OscillateObstacle(cid, b2, axis=1, amplitude=0.3, period=6.0))
         b3, r3 = _box(cid, 17, 5, 0.4, 0.4, color=[0.9, 0.3, 0.1, 0.85])
         mgr.add(RandomWalkObstacle(cid, b3, bounds=[(14.5, 19), (1, 7)],
                                    step_size=0.12, seed=99))
