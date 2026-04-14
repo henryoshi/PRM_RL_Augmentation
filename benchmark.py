@@ -25,23 +25,25 @@ from prm_basic import BasicPRM
 from prm_risk_aware import RiskAwarePRM
 from prm_rl import PRMRL
 from rl.local_policy import LocalPolicy, ReactivePolicy
-from executor import PathExecutor
+from executor import PathExecutor, OnlinePathExecutor
 from metrics import trial_metrics, aggregate, format_table, save_csv
- 
- 
+
+
 # ── Planner registry ────────────────────────────────────────────────
 # Add your own planners here.  Each must subclass PRMBase (see prm_base.py)
 # and implement construct() and find().
 PLANNER_CLASSES = {
-    "Basic":    BasicPRM,
+    "Basic":     BasicPRM,
     "RiskAware": RiskAwarePRM,
-    "PRM-RL":   PRMRL,
+    "PRM-RL":    PRMRL,
 }
  
  
 def make_planner(name: str, env: dict[str, Any], policy_path=None):
     cls = PLANNER_CLASSES[name]
- 
+    min_edge_len = env.get("min_edge_len", 0.0)
+    max_neighbors = env.get("max_neighbors", None)
+
     if name == "PRM-RL":
         if policy_path:
             policy = LocalPolicy(policy_path)
@@ -53,6 +55,7 @@ def make_planner(name: str, env: dict[str, Any], policy_path=None):
             robot_radius=env["robot_radius"],
             dim=env["dim"],
             policy=policy,
+            max_neighbors=max_neighbors,
         )
     elif name == "RiskAware":
         planner = cls(
@@ -64,6 +67,8 @@ def make_planner(name: str, env: dict[str, Any], policy_path=None):
             frontier_frac=env.get("frontier_frac", 0.3),
             frontier_sigma=env.get("frontier_sigma", 0.8),
             repair_samples=env.get("repair_samples", 50),
+            min_edge_len=min_edge_len,
+            max_neighbors=max_neighbors,
         )
     else:
         planner = cls(
@@ -71,6 +76,7 @@ def make_planner(name: str, env: dict[str, Any], policy_path=None):
             workspace_bounds=env["bounds"],
             robot_radius=env["robot_radius"],
             dim=env["dim"],
+            max_neighbors=max_neighbors,
         )
  
     all_ids = env["static_ids"] + env["dyn_manager"].body_ids
@@ -80,9 +86,15 @@ def make_planner(name: str, env: dict[str, Any], policy_path=None):
  
 def run_trial(env_name, difficulty, planner_name, gui=False, policy_path=None,
               risk_beta=0.5, frontier_frac=0.3, frontier_sigma=0.8,
-              repair_samples=50):
-    """Run a single cold-start trial. Returns a per-trial metric dict."""
- 
+              repair_samples=50, min_edge_len=0.0,
+              mode="offline", online_samples_per_tick=15):
+    """Run a single trial. Returns a per-trial metric dict.
+
+    mode='offline' (default): pre-build roadmap on static map, then execute.
+    mode='online': discover obstacles incrementally during execution;
+                   only supported for RiskAware planner.
+    """
+
     # 1. Build fresh environment
     builder = ENV_BUILDERS[env_name]
     env: dict[str, Any] = builder(difficulty=difficulty, gui=gui)
@@ -90,8 +102,10 @@ def run_trial(env_name, difficulty, planner_name, gui=False, policy_path=None,
     env["frontier_frac"] = frontier_frac
     env["frontier_sigma"] = frontier_sigma
     env["repair_samples"] = repair_samples
- 
-    # 2. Create planner (cold start)
+
+    # 2. Create planner
+    if min_edge_len > 0.0:
+        env["min_edge_len"] = min_edge_len   # CLI override wins over env default
     planner = make_planner(planner_name, env, policy_path=policy_path)
 
     # Reset dynamic obstacles to t=0
@@ -99,39 +113,51 @@ def run_trial(env_name, difficulty, planner_name, gui=False, policy_path=None,
 
     t0 = time.perf_counter()
 
-    # 3. Construct roadmap on the STATIC environment only.
-    #    Dynamic obstacles are handled reactively during execution via replanning.
-    #    This matches the cold-start narrative: build a static prior, adapt online.
-    planner.set_obstacles(env["static_ids"])
-    planner.construct(env["N"], env["dmax"], verbose=False)
+    if mode == "online":
+        # Online mode: world obstacles revealed incrementally by the robot sensor.
+        # No upfront construct() or find() — roadmap grows during execution.
+        dyn_ids = env["dyn_manager"].body_ids
+        planner.set_world_obstacles(env["static_ids"] + dyn_ids,
+                                    dynamic_ids=dyn_ids)
+        executor = OnlinePathExecutor(
+            planner, env,
+            online_samples_per_tick=online_samples_per_tick)
+        record = executor.execute()
+        record.planning_time = 0.0   # no offline planning phase
+    else:
+        # Offline mode: pre-build roadmap on static env, adapt dynamically at runtime
+        planner.set_obstacles(env["static_ids"])
+        planner.construct(env["N"], env["dmax"], verbose=False)
 
-    # 4. Find initial path (dynamic obstacles not yet in play)
-    path, cost = planner.find(env["start"], env["goal"], env["dmax"])
+        # Find initial path (dynamic obstacles not yet in play)
+        path, cost = planner.find(env["start"], env["goal"], env["dmax"])
+        planning_dt = time.perf_counter() - t0
 
-    planning_dt = time.perf_counter() - t0
+        # Execute path, updating obstacles each step
+        dyn_ids = env["dyn_manager"].body_ids
+        planner.set_obstacles(env["static_ids"] + dyn_ids, dynamic_ids=dyn_ids)
+        executor = PathExecutor(planner, env)
+        record = executor.execute(path, cost)
+        record.planning_time = planning_dt
 
-    # 5. Execute path, updates obstacle each step
-    planner.set_obstacles(env["static_ids"] + env["dyn_manager"].body_ids)
-    executor = PathExecutor(planner, env)
-    record = executor.execute(path, cost)
-    record.planning_time = planning_dt
     record.total_time = time.perf_counter() - t0
- 
+
     # Tear down
     p.disconnect(env["cid"])
- 
+
     return trial_metrics(record, dim=env["dim"])
  
  
 def run_benchmark(envs, difficulties, planners, n_trials, gui=False,
                   policy_path=None, risk_beta=0.5, frontier_frac=0.3,
-                  frontier_sigma=0.8, repair_samples=50):
+                  frontier_sigma=0.8, repair_samples=50, min_edge_len=0.0,
+                  mode="offline", online_samples_per_tick=15):
     """Run the full benchmark matrix."""
     all_results = {}
- 
+
     total = len(envs) * len(difficulties) * len(planners) * n_trials
     done = 0
- 
+
     for env_name in envs:
         for diff in difficulties:
             diff_label = DIFFICULTY_LABELS[diff]
@@ -142,13 +168,16 @@ def run_benchmark(envs, difficulties, planners, n_trials, gui=False,
                     done += 1
                     seed = trial * 1000 + diff * 100 + hash(env_name) % 100
                     np.random.seed(seed)
- 
+
                     result = run_trial(env_name, diff, pname, gui=gui,
                                        policy_path=policy_path,
                                        risk_beta=risk_beta,
                                        frontier_frac=frontier_frac,
                                        frontier_sigma=frontier_sigma,
-                                       repair_samples=repair_samples)
+                                       repair_samples=repair_samples,
+                                       min_edge_len=min_edge_len,
+                                       mode=mode,
+                                       online_samples_per_tick=online_samples_per_tick)
                     trials.append(result)
  
                     status = "OK" if result["success"] else "FAIL"
@@ -192,6 +221,14 @@ def main():
                         help="RiskAware: Gaussian spread for frontier samples")
     parser.add_argument("--repair-samples", type=int, default=50,
                         help="RiskAware: local samples added during replan")
+    parser.add_argument("--min-edge-len", type=float, default=0.0,
+                        help="Skip edges shorter than this (m); prunes near-duplicate "
+                             "connections when using higher N (e.g. robot_radius=0.2)")
+    parser.add_argument("--mode", choices=["offline", "online"], default="offline",
+                        help="offline (default): pre-build roadmap; "
+                             "online: incremental discovery (RiskAware only)")
+    parser.add_argument("--online-samples-per-tick", type=int, default=15,
+                        help="Online mode: roadmap nodes added per tick (default: 15)")
     args = parser.parse_args()
 
     if not (0.0 <= args.frontier_frac <= 1.0):
@@ -212,7 +249,10 @@ def main():
         risk_beta=args.risk_beta,
         frontier_frac=args.frontier_frac,
         frontier_sigma=args.frontier_sigma,
-        repair_samples=args.repair_samples)
+        repair_samples=args.repair_samples,
+        min_edge_len=args.min_edge_len,
+        mode=args.mode,
+        online_samples_per_tick=args.online_samples_per_tick)
  
     save_csv(results, args.csv)
     print("\n" + format_table(results))

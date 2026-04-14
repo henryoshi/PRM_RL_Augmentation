@@ -104,6 +104,7 @@ def build_simple(difficulty=0, gui=False):
         noise=MotionNoise(noise_std, dim=2, bounds=[(0, 12), (0, 12)]),
         bounds=[(0, 12), (0, 12)], start=(1.0, 1.0), goal=(11.0, 11.0),
         dim=2, dmax=3.0, N=300, robot_radius=0.2,
+        sense_radius=4.0,   # online mode: obstacles revealed within this radius
         rects=rects, dyn_rects=dyn_rects,
     )
 
@@ -167,15 +168,25 @@ def build_office(difficulty=0, gui=False):
     noise_std = 0.0
 
     if difficulty >= 2:
-        b1, r1 = _box(cid, 10, 7, 0.35, 0.35, color=[0.9, 0.3, 0.1, 0.85])
-        mgr.add(PatrolObstacle(cid, b1, [10, 2, 1], [10, 13, 1], speed=0.8))
-        # NOTE: Changed oscilation because all PRMs were failing...
-        b2, r2 = _box(cid, 7, 6.95, 0.15, 0.20, color=[0.9, 0.3, 0.1, 0.85])
-        mgr.add(OscillateObstacle(cid, b2, axis=1, amplitude=0.3, period=6.0))
-        b3, r3 = _box(cid, 17, 5, 0.4, 0.4, color=[0.9, 0.3, 0.1, 0.85])
-        mgr.add(RandomWalkObstacle(cid, b3, bounds=[(14.5, 19), (1, 7)],
-                                   step_size=0.12, seed=99))
-        dyn_rects.extend([r1, r2, r3])
+        # 5 random-walk obstacles spread across different rooms/corridors.
+        # Each stays within its own room bounds so it wanders naturally
+        # without permanently blocking any doorway.
+        # Bounds are inset ~0.5 m from wall faces so momentum walkers
+        # never reach a wall without the bounds bounce firing first.
+        # No per-tick PyBullet collision check needed.
+        _dyn_specs = [
+            # (cx,   cy,   hx,   hy,    bounds_x,       bounds_y,      seed)
+            (3.0,  2.0,  0.35, 0.35, (0.7,  6.4), (0.7,  3.8),   11),  # left lower
+            (3.0, 12.0,  0.35, 0.35, (0.7,  6.4), (10.7, 14.3),  22),  # left upper
+            (10.0,  3.5, 0.35, 0.35, (7.7, 13.3), (0.7,  9.3),   33),  # mid lower
+            (10.5, 12.5, 0.35, 0.35, (7.7, 13.3), (10.7, 14.3),  44),  # mid upper
+            (17.0,  7.0, 0.35, 0.35, (14.7, 19.3),(0.7, 14.3),   55),  # right room
+        ]
+        for cx, cy, hx, hy, bx, by, seed in _dyn_specs:
+            b, r = _box(cid, cx, cy, hx, hy, color=[0.9, 0.3, 0.1, 0.85])
+            mgr.add(RandomWalkObstacle(cid, b, bounds=[bx, by],
+                                       step_size=0.3, seed=seed))
+            dyn_rects.append(r)
 
     if difficulty in (1, 3):
         noise_std = 0.06
@@ -184,7 +195,12 @@ def build_office(difficulty=0, gui=False):
         cid=cid, static_ids=static, dyn_manager=mgr,
         noise=MotionNoise(noise_std, dim=2, bounds=[(0, 20), (0, 15)]),
         bounds=[(0, 20), (0, 15)], start=(1.5, 1.5), goal=(18.5, 13.5),
-        dim=2, dmax=3.0, N=600, robot_radius=0.2,
+        dim=2, dmax=3.5, N=1000, robot_radius=0.2, min_edge_len=0.5,
+        frontier_frac=0.15,   # lower than default — office has many rooms,
+                              # heavy biasing starves the right side of samples
+        max_neighbors=10,     # cap per-node degree: N=1000+dmax=3.5 → ~80
+                              # candidate neighbours → 40k edges without this
+        sense_radius=5.0,     # online mode: obstacle reveal radius
         rects=rects, dyn_rects=dyn_rects,
     )
 
@@ -251,6 +267,7 @@ def build_cityscape(difficulty=0, gui=False):
         bounds=[(0, 40), (0, 40), (1, 25)],
         start=(2.0, 2.0, 5.0), goal=(38.0, 38.0, 15.0),
         dim=3, dmax=8.0, N=800, robot_radius=0.4,
+        sense_radius=10.0,  # online mode: obstacle reveal radius
         rects=rects, dyn_rects=dyn_rects,
         buildings=_BUILDINGS,
     )
