@@ -18,6 +18,8 @@ from environments import ENV_BUILDERS, DIFFICULTY_LABELS
 from prm_basic import BasicPRM
 from prm_risk_aware import RiskAwarePRM
 from prm_rl import PRMRL
+from prm_frontier_rl import FrontierRLPRM
+from prm_rl_adaptive import AdaptivePRMRL
 from rl.local_policy import LocalPolicy, ReactivePolicy
 from executor import PathExecutor, OnlinePathExecutor
 from metrics import trial_metrics
@@ -29,7 +31,9 @@ from metrics import trial_metrics
 PLANNER_CLASSES = {
     "Basic":        BasicPRM,
     "RiskAware":    RiskAwarePRM,
-    "PRM-RL":    PRMRL,
+    "PRM-RL":       PRMRL,
+    "FrontierRL":   FrontierRLPRM,
+    "AdaptiveRL":   AdaptivePRMRL,
 }
 
 
@@ -310,6 +314,15 @@ def main():
         planner = cls(client_id=env["cid"], workspace_bounds=env["bounds"],
                       robot_radius=env["robot_radius"], dim=env["dim"],
                       policy=policy, max_neighbors=max_neighbors)
+    elif args.planner in ("FrontierRL", "AdaptiveRL"):
+        if args.policy:
+            policy = LocalPolicy(args.policy)
+        else:
+            print("  (No --policy given, using ReactivePolicy fallback)")
+            policy = ReactivePolicy()
+        planner = cls(client_id=env["cid"], workspace_bounds=env["bounds"],
+                      robot_radius=env["robot_radius"], dim=env["dim"],
+                      policy=policy)
     elif args.planner == "RiskAware":
         planner = cls(client_id=env["cid"], workspace_bounds=env["bounds"],
                       robot_radius=env["robot_radius"], dim=env["dim"],

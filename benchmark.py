@@ -24,6 +24,8 @@ from environments import ENV_BUILDERS, DIFFICULTY_LABELS
 from prm_basic import BasicPRM
 from prm_risk_aware import RiskAwarePRM
 from prm_rl import PRMRL
+from prm_frontier_rl import FrontierRLPRM
+from prm_rl_adaptive import AdaptivePRMRL
 from rl.local_policy import LocalPolicy, ReactivePolicy
 from executor import PathExecutor, OnlinePathExecutor
 from metrics import trial_metrics, aggregate, format_table, save_csv
@@ -33,9 +35,11 @@ from metrics import trial_metrics, aggregate, format_table, save_csv
 # Add your own planners here.  Each must subclass PRMBase (see prm_base.py)
 # and implement construct() and find().
 PLANNER_CLASSES = {
-    "Basic":     BasicPRM,
-    "RiskAware": RiskAwarePRM,
-    "PRM-RL":    PRMRL,
+    "Basic":      BasicPRM,
+    "RiskAware":  RiskAwarePRM,
+    "PRM-RL":     PRMRL,
+    "FrontierRL": FrontierRLPRM,
+    "AdaptiveRL": AdaptivePRMRL,
 }
  
  
@@ -55,7 +59,18 @@ def make_planner(name: str, env: dict[str, Any], policy_path=None):
             robot_radius=env["robot_radius"],
             dim=env["dim"],
             policy=policy,
-            max_neighbors=max_neighbors,
+        )
+    elif name in ("FrontierRL", "AdaptiveRL"):
+        if policy_path:
+            policy = LocalPolicy(policy_path)
+        else:
+            policy = ReactivePolicy()
+        planner = cls(
+            client_id=env["cid"],
+            workspace_bounds=env["bounds"],
+            robot_radius=env["robot_radius"],
+            dim=env["dim"],
+            policy=policy,
         )
     elif name == "RiskAware":
         planner = cls(

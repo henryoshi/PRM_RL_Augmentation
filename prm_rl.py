@@ -68,7 +68,7 @@ class PRMRL(PRMBase):
         # Pre-compute ray angles (must match rl_env.py)
         self._ray_angles = np.linspace(0, 2 * np.pi, n_rays, endpoint=False)
 
-    # ── Lidar sensing (same logic as rl_env.py) ─────────────────────
+   
 
     def _cast_rays(self, pos):
         """Cast n_rays from pos, return normalised hit fractions."""
@@ -87,7 +87,7 @@ class PRMRL(PRMBase):
 
         return dists
 
-    # ── Monte Carlo edge validation (Equation 3) ────────────────────
+    
 
     def _mc_validate_edge(self, v_start, v_goal):
         """
@@ -154,7 +154,7 @@ class PRMRL(PRMBase):
 
         return success_rate, avg_length
 
-    # ── PRM construction with RL edge validation ────────────────────
+    
 
     def construct(self, N, dmax, verbose=False, **kw):
         """
@@ -200,7 +200,7 @@ class PRMRL(PRMBase):
 
         return self.G
 
-    # ── Path finding ─────────────────────────────────────────────────
+    
 
     def find(self, start, goal, dmax, max_retries=5, extra=50, **kw):
         """
