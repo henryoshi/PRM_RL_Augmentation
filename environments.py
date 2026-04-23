@@ -25,10 +25,23 @@ Difficulty levels:
 import numpy as np
 import pybullet as p
 import pybullet_data
-from dynamics import (DynamicObstacleManager, PatrolObstacle,
-                      OscillateObstacle, RandomWalkObstacle, MotionNoise)
+from dynamics import (DynamicObstacleManager, LinearObstacle, MotionNoise)
 
 WALL_HEIGHT = 1.0
+
+# ── Velocity helpers ─────────────────────────────────────────────────
+
+def _rand_vel_2d(speed):
+    angle = np.random.uniform(0, 2 * np.pi)
+    return float(speed * np.cos(angle)), float(speed * np.sin(angle))
+
+def _rand_vel_3d(speed):
+    cos_theta = np.random.uniform(-1, 1)
+    sin_theta = np.sqrt(max(0.0, 1 - cos_theta ** 2))
+    phi = np.random.uniform(0, 2 * np.pi)
+    return (float(speed * sin_theta * np.cos(phi)),
+            float(speed * sin_theta * np.sin(phi)),
+            float(speed * cos_theta))
 
 # ── Helper ───────────────────────────────────────────────────────────
 
@@ -90,11 +103,20 @@ def build_simple(difficulty=0, gui=False):
     noise_std = 0.0
 
     if difficulty >= 2:
-        b1, r1 = _box(cid, 6.0, 9.0, 0.5, 0.5, color=[0.8, 0.2, 0.2, 0.8])
-        mgr.add(PatrolObstacle(cid, b1, [4, 9, 1], [10, 9, 1], speed=1.2))
-        b2, r2 = _box(cid, 7.5, 6.0, 0.15, 1.0, color=[0.8, 0.2, 0.2, 0.8])
-        mgr.add(OscillateObstacle(cid, b2, axis=1, amplitude=1.5, period=4.0))
-        dyn_rects.extend([r1, r2])
+        # 4 linear movers in key corridors, matching office-style dynamics.
+        # Each is 0.3×0.3 m — small enough to not permanently block passages,
+        # large enough to force replanning when they cross the robot's path.
+        _dyn_starts = [
+            (2.0,  3.0,  0.3, 0.3),
+            (5.0,  8.0,  0.3, 0.3),
+            (9.0,  8.0,  0.3, 0.3),
+            (10.5, 4.0,  0.3, 0.3),
+        ]
+        _ws = [(0, 12), (0, 12)]
+        for cx, cy, hx, hy in _dyn_starts:
+            b, r = _box(cid, cx, cy, hx, hy, color=[0.9, 0.3, 0.1, 0.85])
+            mgr.add(LinearObstacle(cid, b, velocity=_rand_vel_2d(0.4), bounds=_ws))
+            dyn_rects.append(r)
 
     if difficulty in (1, 3):
         noise_std = 0.08
@@ -174,18 +196,17 @@ def build_office(difficulty=0, gui=False):
         # Bounds are inset ~0.5 m from wall faces so momentum walkers
         # never reach a wall without the bounds bounce firing first.
         # No per-tick PyBullet collision check needed.
-        _dyn_specs = [
-            # (cx,   cy,   hx,   hy,    bounds_x,       bounds_y,      seed)
-            (3.0,  2.0,  0.35, 0.35, (0.7,  6.4), (0.7,  3.8),   11),  # left lower
-            (3.0, 12.0,  0.35, 0.35, (0.7,  6.4), (10.7, 14.3),  22),  # left upper
-            (10.0,  3.5, 0.35, 0.35, (7.7, 13.3), (0.7,  9.3),   33),  # mid lower
-            (10.5, 12.5, 0.35, 0.35, (7.7, 13.3), (10.7, 14.3),  44),  # mid upper
-            (17.0,  7.0, 0.35, 0.35, (14.7, 19.3),(0.7, 14.3),   55),  # right room
+        _dyn_starts = [
+            (3.0,  2.0,  0.35, 0.35),
+            (3.0, 12.0,  0.35, 0.35),
+            (10.0,  3.5, 0.35, 0.35),
+            (10.5, 12.5, 0.35, 0.35),
+            (17.0,  7.0, 0.35, 0.35),
         ]
-        for cx, cy, hx, hy, bx, by, seed in _dyn_specs:
+        _ws = [(0, 20), (0, 15)]
+        for cx, cy, hx, hy in _dyn_starts:
             b, r = _box(cid, cx, cy, hx, hy, color=[0.9, 0.3, 0.1, 0.85])
-            mgr.add(RandomWalkObstacle(cid, b, bounds=[bx, by],
-                                       step_size=0.3, seed=seed))
+            mgr.add(LinearObstacle(cid, b, velocity=_rand_vel_2d(0.4), bounds=_ws))
             dyn_rects.append(r)
 
     if difficulty in (1, 3):
@@ -196,10 +217,10 @@ def build_office(difficulty=0, gui=False):
         noise=MotionNoise(noise_std, dim=2, bounds=[(0, 20), (0, 15)]),
         bounds=[(0, 20), (0, 15)], start=(1.5, 1.5), goal=(18.5, 13.5),
         dim=2, dmax=3.5, N=1000, robot_radius=0.2, min_edge_len=0.5,
-        frontier_frac=0.15,   # lower than default — office has many rooms,
-                              # heavy biasing starves the right side of samples
-        max_neighbors=10,     # cap per-node degree: N=1000+dmax=3.5 → ~80
-                              # candidate neighbours → 40k edges without this
+        frontier_frac=0.25,   # raised from 0.15: more doorway-biased samples
+                              # needed to bridge narrow passages reliably
+        max_neighbors=15,     # raised from 10: doorway-adjacent nodes need
+                              # cross-wall neighbors in their k-NN candidate set
         sense_radius=5.0,     # online mode: obstacle reveal radius
         rects=rects, dyn_rects=dyn_rects,
     )
@@ -241,20 +262,20 @@ def build_cityscape(difficulty=0, gui=False):
     dyn_rects = []
     noise_std = 0.0
 
+    _cs_bounds = [(0, 40), (0, 40), (1, 25)]
     if difficulty >= 2:
         d1, r1 = _box(cid, 15, 15, 0.6, 0.6, hz=0.6,
                        color=[1, 0.2, 0.2, 0.8], cz=12)
-        mgr.add(PatrolObstacle(cid, d1, [10, 10, 12], [30, 30, 12],
-                               speed=2.0, dim=3))
+        mgr.add(LinearObstacle(cid, d1, velocity=_rand_vel_3d(2.5),
+                               bounds=_cs_bounds, dim=3))
         d2, r2 = _box(cid, 25, 15, 0.5, 0.5, hz=0.5,
                        color=[1, 0.2, 0.2, 0.8], cz=8)
-        mgr.add(PatrolObstacle(cid, d2, [20, 10, 8], [30, 25, 14],
-                               speed=1.5, dim=3))
+        mgr.add(LinearObstacle(cid, d2, velocity=_rand_vel_3d(2.5),
+                               bounds=_cs_bounds, dim=3))
         d3, r3 = _box(cid, 20, 20, 0.5, 0.5, hz=0.5,
                        color=[1, 0.2, 0.2, 0.8], cz=15)
-        mgr.add(RandomWalkObstacle(cid, d3,
-                                   bounds=[(5, 35), (5, 35), (5, 20)],
-                                   step_size=0.25, dim=3, seed=42))
+        mgr.add(LinearObstacle(cid, d3, velocity=_rand_vel_3d(2.5),
+                               bounds=_cs_bounds, dim=3))
         dyn_rects.extend([r1, r2, r3])
 
     if difficulty in (1, 3):
@@ -265,9 +286,10 @@ def build_cityscape(difficulty=0, gui=False):
         noise=MotionNoise(noise_std, dim=3,
                           bounds=[(0, 40), (0, 40), (1, 25)]),
         bounds=[(0, 40), (0, 40), (1, 25)],
-        start=(2.0, 2.0, 5.0), goal=(38.0, 38.0, 15.0),
-        dim=3, dmax=8.0, N=800, robot_radius=0.4,
-        sense_radius=10.0,  # online mode: obstacle reveal radius
+        start=(2.0, 2.0, 5.0), goal=(38.0, 38.0, 5.0),
+        dim=3, dmax=6.0, N=1500, robot_radius=0.3, max_neighbors=12,
+        sense_radius=14.0,
+        max_nodes_multiplier=3,   # online node cap = N * this (3D needs more)
         rects=rects, dyn_rects=dyn_rects,
         buildings=_BUILDINGS,
     )

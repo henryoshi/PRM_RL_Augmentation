@@ -16,7 +16,7 @@ import matplotlib.patches as patches
 
 from environments import ENV_BUILDERS, DIFFICULTY_LABELS
 from prm_basic import BasicPRM
-from prm_risk_aware import RiskAwarePRM
+from prm_risk_aware_cc import RiskAwarePRM
 from prm_rl import PRMRL
 from prm_frontier_rl import FrontierRLPRM
 from prm_rl_adaptive import AdaptivePRMRL
@@ -41,7 +41,7 @@ def _draw_rects(ax, rects, facecolor='#555555', edgecolor='#333333',
                 label=None):
     """Draw obstacle rectangles on a matplotlib axes (top-down view).
     Each rect = (cx, cy, hx, hy, height)."""
-    for i, (cx, cy, hx, hy, _h) in enumerate(rects):
+    for i, (cx, cy, hx, hy, *_) in enumerate(rects):
         ax.add_patch(patches.Rectangle(
             (cx - hx, cy - hy), 2 * hx, 2 * hy,
             facecolor=facecolor, edgecolor=edgecolor, linewidth=0.6,
@@ -75,7 +75,7 @@ def _draw_dyn_trails(ax, dyn_positions_log, label_prefix="Dyn obs"):
 
 def plot_plan_2d(env, planner, path, title=""):
     """Top-down view of the roadmap and planned path, before execution."""
-    fig, ax = plt.subplots(figsize=(8, 7))
+    _, ax = plt.subplots(figsize=(8, 7))
     xmax = env["bounds"][0][1]
     ymax = env["bounds"][1][1]
 
@@ -156,54 +156,127 @@ def plot_plan_3d(env, planner, path, title=""):
     plt.show()
 
 
+def _print_failure_diagnostics(env, planner, record):
+    """Print structured failure info to localise the cause."""
+    if not record.executed_positions:
+        print("[DEBUG] No positions recorded — failed before first step.")
+        return
+
+    fail_pos = record.executed_positions[-1]
+    dim      = env["dim"]
+    goal     = env["goal"]
+
+    dist_to_goal = float(np.linalg.norm(
+        np.array(fail_pos[:dim]) - np.array(goal[:dim])))
+    clr          = planner.clearance(fail_pos)
+    is_collision = not planner.is_free(fail_pos)
+
+    dists     = [float(np.linalg.norm(
+                    np.array(p[:dim]) - np.array(goal[:dim])))
+                 for p in record.executed_positions]
+    best_step = int(np.argmin(dists))
+    best_dist = dists[best_step]
+
+    print("\n── Failure Diagnostics ─────────────────────────────────────")
+    print(f"  Steps taken:    {len(record.executed_positions) - 1}")
+    print(f"  Fail position:  ({', '.join(f'{v:.3f}' for v in fail_pos)})")
+    print(f"  Dist to goal:   {dist_to_goal:.2f} m")
+    print(f"  Clearance:      {clr:.4f} m  "
+          f"(threshold={env['robot_radius'] * 1.5:.3f}, "
+          f"radius={env['robot_radius']:.2f})")
+    print(f"  Cause:          "
+          f"{'COLLISION — clearance < robot_radius' if is_collision else 'TIMEOUT / no-path — max steps or wait ticks exceeded'}")
+    print(f"  Closest to goal: step {best_step},  dist {best_dist:.2f} m")
+    if record.clearances:
+        min_step = int(np.argmin(record.clearances))
+        print(f"  Min clearance:  {record.clearances[min_step]:.4f} m "
+              f"at step {min_step}")
+        recent = record.clearances[-min(10, len(record.clearances)):]
+        print(f"  Last {len(recent)} clearances: "
+              f"{[f'{c:.3f}' for c in recent]}")
+    print(f"  Graph at failure: {planner.G.number_of_nodes()} nodes, "
+          f"{planner.G.number_of_edges()} edges")
+    print(f"  Replans: {record.replans},  Wait ticks: {record.wait_ticks}")
+    print("────────────────────────────────────────────────────────────")
+
+
 def plot_2d(env, planner, record, title=""):
-    """Top-down matplotlib visualisation for 2D scenarios."""
-    fig, axes = plt.subplots(1, 2, figsize=(14, 6))
+    """Top-down matplotlib visualisation for 2D scenarios — one window per panel."""
     xmax = env["bounds"][0][1]
     ymax = env["bounds"][1][1]
-
     static_rects = env.get("rects", [])
-    dyn_rects = env.get("dyn_rects", [])
+    dyn_rects    = env.get("dyn_rects", [])
+    fail_pos     = (record.executed_positions[-1]
+                    if not record.success and record.executed_positions
+                    else None)
 
-    for ax_idx, ax in enumerate(axes):
+    def _base_ax(fig_title):
+        fig, ax = plt.subplots(figsize=(8, 7))
         ax.set_xlim(0, xmax)
         ax.set_ylim(0, ymax)
         ax.set_aspect('equal')
         ax.set_facecolor('#f0f0f0')
-
-        # Draw static obstacles
+        ax.set_title(fig_title, fontsize=11)
         _draw_rects(ax, static_rects, facecolor='#555555',
                     edgecolor='#333333', label='Static obstacle')
-        # Draw dynamic obstacle initial positions (snapshot from env)
         _draw_rects(ax, dyn_rects, facecolor='#cc3333',
                     edgecolor='#881111', label='Dyn obs (init)')
-
-        if ax_idx == 0:
-            ax.set_title("PRM Roadmap")
-            for u, v in planner.G.edges:
-                ax.plot([u[0], v[0]], [u[1], v[1]],
-                        color='steelblue', lw=0.25, alpha=0.4)
-            xs = [n[0] for n in planner.G.nodes]
-            ys = [n[1] for n in planner.G.nodes]
-            ax.scatter(xs, ys, s=3, c='steelblue', zorder=3)
-        else:
-            ax.set_title("Executed Trajectory + Dynamic Obstacle Trails")
-            # Draw recorded dynamic obstacle trajectories only on trajectory panel
-            _draw_dyn_trails(ax, record.dyn_obstacle_positions)
-
-        if record.executed_positions:
-            px = [pt[0] for pt in record.executed_positions]
-            py = [pt[1] for pt in record.executed_positions]
-            ax.plot(px, py, color='red', lw=1.8, zorder=4, label='Robot path')
-
         s, g = env["start"], env["goal"]
         ax.plot(s[0], s[1], 'go', ms=10, zorder=5, label='Start')
         ax.plot(g[0], g[1], 'b^', ms=10, zorder=5, label='Goal')
-        ax.legend(loc='upper left', fontsize=7)
+        return fig, ax
 
-    fig.suptitle(title, fontsize=13)
+    # ── Panel 1: PRM Roadmap ─────────────────────────────────────────
+    fig1, ax1 = _base_ax(f"{title} — PRM Roadmap")
+    for u, v in planner.G.edges:
+        ax1.plot([u[0], v[0]], [u[1], v[1]],
+                 color='steelblue', lw=0.25, alpha=0.4)
+    xs = [n[0] for n in planner.G.nodes]
+    ys = [n[1] for n in planner.G.nodes]
+    ax1.scatter(xs, ys, s=3, c='steelblue', zorder=3)
+    if record.executed_positions:
+        px = [pt[0] for pt in record.executed_positions]
+        py = [pt[1] for pt in record.executed_positions]
+        ax1.plot(px, py, color='red', lw=1.8, zorder=4, label='Robot path')
+    if fail_pos:
+        ax1.plot(fail_pos[0], fail_pos[1], 'rx', ms=14, mew=2.5,
+                 zorder=8, label='Failure point')
+    ax1.legend(loc='upper left', fontsize=7)
     plt.tight_layout()
     plt.savefig("result_single.png", dpi=150)
+
+    # ── Panel 2: Executed Trajectory ────────────────────────────────
+    fig2, ax2 = _base_ax(f"{title} — Executed Trajectory")
+    _draw_dyn_trails(ax2, record.dyn_obstacle_positions)
+    if record.executed_positions:
+        px = [pt[0] for pt in record.executed_positions]
+        py = [pt[1] for pt in record.executed_positions]
+        ax2.plot(px, py, color='red', lw=1.8, zorder=4, label='Robot path')
+    if fail_pos:
+        ax2.plot(fail_pos[0], fail_pos[1], 'rx', ms=14, mew=2.5,
+                 zorder=8, label='Failure point')
+    ax2.legend(loc='upper left', fontsize=7)
+    plt.tight_layout()
+
+    # ── Panel 3: Clearance over time (optional) ──────────────────────
+    if record.clearances:
+        fig3, ax3 = plt.subplots(figsize=(8, 5))
+        steps = list(range(len(record.clearances)))
+        ax3.plot(steps, record.clearances, color='#2d7dc0', lw=1.0,
+                 label='Clearance')
+        ax3.axhline(env['robot_radius'] * 1.5, color='#c0392b', lw=0.9,
+                    linestyle='--', label='Gate (1.5×r)')
+        ax3.axhline(env['robot_radius'], color='#e07000', lw=0.9,
+                    linestyle=':', label='Collision (r)')
+        if fail_pos:
+            ax3.axvline(len(record.clearances) - 1, color='red', lw=1.2,
+                        linestyle=':', label='Failure step')
+        ax3.set_xlabel("Step")
+        ax3.set_ylabel("Clearance (m)")
+        ax3.set_title(f"{title} — Clearance Over Time", fontsize=11)
+        ax3.legend(fontsize=7)
+        plt.tight_layout()
+
     plt.show()
 
 
@@ -241,6 +314,10 @@ def plot_3d(env, planner, record, title=""):
         pts = record.executed_positions
         ax.plot([pt[0] for pt in pts], [pt[1] for pt in pts],
                 [pt[2] for pt in pts], color='red', lw=2.5, label='Path')
+        if not record.success:
+            fp = pts[-1]
+            ax.scatter(*fp, color='red', marker='x', s=120, zorder=8,
+                       linewidths=2.5, label='Failure point')
 
     s, g = env["start"], env["goal"]
     ax.scatter(*s, color='green', s=80, zorder=6, label='Start')
@@ -394,6 +471,9 @@ def main():
     print(f"  Smoothness:    {m['smoothness']:.3f}")
     print(f"  Min clearance: {m['min_clearance']:.4f}")
     print(f"  Replans:       {m['replans']}")
+    print(f"  Wait ticks:    {record.wait_ticks}")
+    if not m["success"]:
+        _print_failure_diagnostics(env, planner, record)
 
     # Draw path + markers in PyBullet viewer
     if args.gui and record.executed_positions:

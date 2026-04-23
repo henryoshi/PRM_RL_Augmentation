@@ -79,6 +79,37 @@ class PRMBase:
                 result.append(oid)
         return result
 
+    def _los_free(self, a, b):
+        """True if segment a→b has clear line of sight through static walls.
+
+        Uses static geometry only (registered by set_world_obstacles) so the
+        check is valid even before obstacles are discovered in online mode.
+        Step size = robot_radius, matching edge_free's detection guarantee.
+        Returns True in offline mode (no static geometry registered).
+        """
+        if not hasattr(self, '_static_aabbs') or not self._static_aabbs:
+            return True
+        a_arr = np.asarray(a[:self.dim], dtype=float)
+        b_arr = np.asarray(b[:self.dim], dtype=float)
+        n = max(int(np.linalg.norm(b_arr - a_arr) / self.radius), 2)
+        for i in range(n + 1):
+            pos = self._to_3d(a_arr + (i / n) * (b_arr - a_arr))
+            p.resetBasePositionAndOrientation(
+                self._probe, pos, [0, 0, 0, 1], physicsClientId=self.cid)
+            px, py, pz = float(pos[0]), float(pos[1]), float(pos[2])
+            for oid, mn, mx in self._static_aabbs:
+                if mn is not None:
+                    cx = mn[0] if px < mn[0] else (mx[0] if px > mx[0] else px)
+                    cy = mn[1] if py < mn[1] else (mx[1] if py > mx[1] else py)
+                    cz = mn[2] if pz < mn[2] else (mx[2] if pz > mx[2] else pz)
+                    if ((px-cx)**2 + (py-cy)**2 + (pz-cz)**2
+                            > (self.radius + 0.05)**2):
+                        continue
+                if p.getClosestPoints(
+                        self._probe, oid, 0.0, physicsClientId=self.cid):
+                    return False
+        return True
+
     def set_world_obstacles(self, ids, dynamic_ids=None):
         """Online mode: register all world obstacle IDs but reveal none yet.
 
@@ -100,12 +131,23 @@ class PRMBase:
                 self._world_aabbs.append((oid, np.array(mn), np.array(mx)))
             except Exception:
                 self._world_aabbs.append((oid, None, None))
+        # Cache static obstacles for line-of-sight checks — always known even
+        # in online mode because walls are fixed geometry, not discovered.
+        self._static_aabbs = [
+            (oid, mn, mx) for oid, mn, mx in self._world_aabbs
+            if oid not in self._dynamic_ids
+        ]
         # Start with no known obstacles — is_free() sees nothing yet
         self.obstacle_ids = []
         self._obs_aabbs = []
 
-    def _discover_obstacles(self, pos, sense_radius):
+    def _discover_obstacles(self, pos, sense_radius, dyn_sense_radius=None):
         """Reveal world obstacles newly within sense_radius of pos.
+
+        Static obstacles are revealed within sense_radius.
+        Dynamic obstacles are revealed within dyn_sense_radius (defaults to
+        sense_radius if not provided) — set larger to detect moving obstacles
+        earlier and avoid last-second collisions.
 
         Returns a list of newly discovered obstacle IDs (empty if none new).
         Updates obstacle_ids and _obs_aabbs immediately so that subsequent
@@ -116,11 +158,15 @@ class PRMBase:
             return []
         pos_3d = self._to_3d(pos)
         px, py, pz = float(pos_3d[0]), float(pos_3d[1]), float(pos_3d[2])
-        r2 = sense_radius * sense_radius
+        r2_static = sense_radius * sense_radius
+        r2_dyn    = (dyn_sense_radius ** 2 if dyn_sense_radius is not None
+                     else r2_static)
         newly_found = []
         for oid, mn, mx in self._world_aabbs:
             if oid in self._known_ids:
                 continue
+            is_dyn = oid in self._dynamic_ids
+            r2 = r2_dyn if is_dyn else r2_static
             if mn is None:
                 # Dynamic obstacle — refresh AABB from live PyBullet state
                 try:
@@ -172,21 +218,22 @@ class PRMBase:
         a = np.asarray(v1, dtype=float)
         b = np.asarray(v2, dtype=float)
         length = np.linalg.norm(b - a)
-        # Step = robot diameter (2×radius): safe since all obstacles are wider
-        # than a single robot body, and we detect them before overlap.
-        # Previously radius×0.5 — this is 2× faster with equivalent safety.
-        n = max(int(length / (self.radius * 2.0)), 2)
+        # Step = robot_radius: midpoint of any interval is at most radius/2
+        # from a sample, giving a definite probe overlap (gap = -radius/2) that
+        # PyBullet cannot miss due to floating-point boundary cases.
+        # Previously 2×radius (just-touching at midpoints → occasional misses).
+        n = max(int(length / self.radius), 2)
         for i in range(n + 1):
             if not self.is_free(tuple(a + (i / n) * (b - a))):
                 return False
         return True
 
     def _candidate_pairs(self, nodes, dmax, max_neighbors=None):
-        """Return (i,j) index pairs within dmax via KD-tree.
+        """Return (i,j) index pairs via KD-tree.
 
-        If max_neighbors is set, each node connects to at most that many
-        nearest neighbours — caps edge count at N*max_neighbors/2 instead
-        of O(N²) for dense roadmaps (e.g. office with N=1000, dmax=3.5).
+        Without max_neighbors: all pairs within dmax (original behaviour).
+        With max_neighbors: each node connects to its max_neighbors closest
+        nodes with no dmax cutoff — the k-nearest ARE the neighbours.
         """
         if len(nodes) < 2:
             return []
@@ -194,14 +241,13 @@ class PRMBase:
         tree = cKDTree(coords)
         if max_neighbors is None:
             return list(tree.query_pairs(dmax))
-        k = min(max_neighbors + 1, len(nodes))  # +1: query includes self
-        dists, idxs = tree.query(coords, k=k)
+        k = min(max_neighbors + 1, len(nodes))  # +1: self is included
+        _, idxs = tree.query(coords, k=k)
         pairs = set()
         for i in range(len(nodes)):
-            for j_pos in range(k):
-                j = int(idxs[i, j_pos])
-                d = float(dists[i, j_pos])
-                if j != i and d <= dmax:
+            for j in idxs[i]:
+                j = int(j)
+                if j != i:
                     pairs.add((min(i, j), max(i, j)))
         return list(pairs)
 

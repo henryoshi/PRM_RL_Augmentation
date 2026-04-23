@@ -22,7 +22,7 @@ import pybullet as p
  
 from environments import ENV_BUILDERS, DIFFICULTY_LABELS
 from prm_basic import BasicPRM
-from prm_risk_aware import RiskAwarePRM
+from prm_risk_aware_cc import RiskAwarePRM
 from prm_rl import PRMRL
 from prm_frontier_rl import FrontierRLPRM
 from prm_rl_adaptive import AdaptivePRMRL

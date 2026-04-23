@@ -111,8 +111,14 @@ class PathExecutor:
                         pos[:self.dim] for pos in dyn_positions]
                     kwargs["affect_radius"] = dmax * 0.6
                 replan_dmax = dmax * self.replan_dmax_factor
+                # max_retries=1, extra=0: replan on the existing roadmap only.
+                # Allowing retries with extra nodes causes graph explosion —
+                # up to 500 new nodes per replan × 80 wait ticks = 40k nodes,
+                # turning each subsequent _add_vertex into thousands of PyBullet
+                # calls (observed: >1000 s wall-clock for office/noise+dynamic).
                 new_path, new_cost = self.planner.replan(
-                    cur_tuple, goal, replan_dmax, **kwargs)
+                    cur_tuple, goal, replan_dmax,
+                    max_retries=1, extra=0, **kwargs)
                 if new_path is None:
                     # Wait for dynamic obstacles to clear, retrying each tick
                     for _ in range(self.max_wait_ticks):
@@ -125,7 +131,8 @@ class PathExecutor:
                                 pos[:self.dim] for pos in dyn_positions]
                             kw2["affect_radius"] = replan_dmax * 0.6
                         new_path, _ = self.planner.replan(
-                            cur_tuple, goal, replan_dmax, **kw2)
+                            cur_tuple, goal, replan_dmax,
+                            max_retries=1, extra=0, **kw2)
                         if new_path is not None:
                             break
                 if new_path is None:
@@ -178,8 +185,11 @@ class OnlinePathExecutor:
     upfront construct() call.  The roadmap starts empty and grows one tick
     at a time via planner.online_step().
 
-    When no path exists (unexplored region), the robot moves greedily
-    toward the goal until the roadmap becomes connected enough to plan.
+    When no path to the goal exists yet, the planner routes the robot to
+    exploration frontiers — reachable nodes that border unexplored space —
+    so it discovers new corridors and eventually connects to the goal.
+    No greedy goal-directed walk is used; the robot only moves along
+    graph-planned paths or holds position while the roadmap grows.
 
     Parameters
     ----------
@@ -202,6 +212,10 @@ class OnlinePathExecutor:
                              if sense_radius is not None
                              else env.get("sense_radius", env["dmax"]))
         self.online_samples = online_samples_per_tick
+        # Scale node cap with environment complexity: 2× the offline N gives the
+        # online planner enough budget to cover the workspace while remaining
+        # bounded.  simple→600, office→2000, cityscape→1600.
+        self.max_nodes = env.get("N", 300) * env.get("max_nodes_multiplier", 2)
         self.noise = env["noise"]
         self.dyn = env["dyn_manager"]
         self.dim = env["dim"]
@@ -218,6 +232,14 @@ class OnlinePathExecutor:
                 return False
         return True
 
+    def _is_goal_path(self, path, goal):
+        """True if the path's final node is near the goal."""
+        if not path:
+            return False
+        return np.linalg.norm(
+            np.array(path[-1][:self.dim]) - np.array(goal[:self.dim])
+        ) < self.goal_tol
+
     def execute(self):
         """Run online exploration from env start to goal; returns TrajectoryRecord."""
         rec = TrajectoryRecord()
@@ -229,6 +251,7 @@ class OnlinePathExecutor:
         rec.executed_positions.append(tuple(current))
         path   = None
         wp_idx = 1
+        _step = 0
 
         for _step in range(self.max_steps):
             # 1. Tick dynamic obstacles
@@ -241,48 +264,68 @@ class OnlinePathExecutor:
             new_path, _ = self.planner.online_step(
                 tuple(current), goal, dmax,
                 sense_radius=self.sense_radius,
-                n_samples=self.online_samples)
+                n_samples=self.online_samples,
+                max_nodes=self.max_nodes)
 
-            # Accept new path if the current one is absent or now blocked
-            if new_path is not None:
-                if path is None or not self._path_ok(path, wp_idx):
-                    if path is not None:   # existing path was invalidated
-                        rec.replans += 1
-                    path   = new_path
-                    wp_idx = 1
+            # 3. Decide whether to adopt the new path or keep following
+            #    the current one.  Blindly adopting every tick causes
+            #    oscillation: the fresh A* from a slightly shifted position
+            #    may route backward through different edges.
+            #
+            #    Adopt the new path only when:
+            #      (a) we have no current path (or it's exhausted)
+            #      (b) the current path is blocked by a new obstacle
+            #      (c) new path reaches the GOAL while old path doesn't
+            #          (exploration → goal transition)
+            need_new_path = False
+            if path is None or wp_idx >= len(path):
+                need_new_path = True                          # (a) no path
+            elif not self._path_ok(path, wp_idx):
+                need_new_path = True                          # (b) blocked
+                rec.replans += 1
+            elif (new_path is not None
+                  and self._is_goal_path(new_path, goal)
+                  and not self._is_goal_path(path, goal)):
+                need_new_path = True                          # (c) goal found
 
-            # 3. Move: follow path if available, else greedy toward goal
+            if need_new_path and new_path is not None:
+                path   = new_path
+                wp_idx = 1
+
+            # 4. Move: follow path if available, else hold position
             if path is not None and wp_idx < len(path):
                 target = np.array(path[wp_idx], dtype=float)
                 direction = target - current
                 dist_wp = np.linalg.norm(direction)
-                if dist_wp < self.step_size:
-                    commanded = tuple(target)
-                    wp_idx += 1
-                else:
-                    commanded = tuple(current + self.step_size
-                                      * direction / dist_wp)
-            else:
-                # No path yet — head straight toward goal
-                direction = np.array(goal[:self.dim], dtype=float) - current
-                dist_g = np.linalg.norm(direction)
-                if dist_g > 1e-6:
-                    commanded = tuple(current + self.step_size
-                                      * direction / dist_g)
-                else:
+                at_wp = dist_wp < self.step_size
+                proposed = (tuple(target) if at_wp
+                            else tuple(current + self.step_size
+                                       * direction / dist_wp))
+                # For noisy environments, hold if the proposed step is
+                # within 1-sigma of a wall.
+                noise_std = getattr(self.noise, 'std', 0.0)
+                robot_r   = getattr(self.planner, 'radius', 0.0)
+                if (noise_std > 0.0
+                        and self.planner.clearance(proposed) < robot_r + noise_std):
                     commanded = tuple(current)
+                else:
+                    commanded = proposed
+                    if at_wp:
+                        wp_idx += 1
+            else:
+                commanded = tuple(current)
 
             actual = self.noise.apply(commanded)
             current = np.array(actual, dtype=float)
             rec.executed_positions.append(tuple(current))
 
-            # 4. Clearance + collision check
+            # 5. Clearance + collision check
             clr = self.planner.clearance(tuple(current))
             rec.clearances.append(clr)
             if not self.planner.is_free(tuple(current)):
                 break
 
-            # 5. Goal reached?
+            # 6. Goal reached?
             if self._reached_goal(current, goal):
                 rec.success = True
                 break

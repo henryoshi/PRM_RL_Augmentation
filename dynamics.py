@@ -97,6 +97,48 @@ class RandomWalkObstacle(DynamicObstacle):
         return self._pos.tolist()
 
 
+class LinearObstacle(DynamicObstacle):
+    """Constant-velocity linear motion that bounces at workspace bounds.
+
+    The obstacle reflects off each boundary wall, reversing the velocity
+    component that caused the exit.  This prevents teleportation onto the
+    robot that the old modular-wrap implementation could cause.
+    """
+
+    def __init__(self, cid, body_id, velocity, bounds, dim=2):
+        """
+        Parameters
+        ----------
+        velocity : sequence of length dim — (vx, vy) or (vx, vy, vz) in m/s.
+        bounds   : list of (lo, hi) pairs — one per dim, used for bouncing.
+        """
+        super().__init__(cid, body_id, dim)
+        vel = list(velocity) + [0.0] * (3 - len(velocity))
+        self._vel = np.array(vel, dtype=float)
+        self._bounds = list(bounds)
+        self._pos = np.array(self._base_pos[:3], dtype=float)
+        self._t_last = 0.0
+
+    def position_at(self, t):
+        dt = t - self._t_last
+        self._t_last = t
+        for i in range(self.dim):
+            lo, hi = self._bounds[i]
+            self._pos[i] += self._vel[i] * dt
+            # Reflect off each wall; loop handles the case where a large dt
+            # causes the position to overshoot more than once.
+            while True:
+                if self._pos[i] < lo:
+                    self._pos[i] = lo + (lo - self._pos[i])
+                    self._vel[i] = abs(self._vel[i])
+                elif self._pos[i] > hi:
+                    self._pos[i] = hi - (self._pos[i] - hi)
+                    self._vel[i] = -abs(self._vel[i])
+                else:
+                    break
+        return self._pos.tolist()
+
+
 # ═══════════════════════════════════════════════════════════════════════
 #  Manager — ticks all dynamic obstacles at once
 # ═══════════════════════════════════════════════════════════════════════
